@@ -104,7 +104,7 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
     *(u64 *)loc = val;
     return;
   case R_AARCH64_PREL32:
-    *(u32 *)loc = val - this->shdr.sh_addr - offset;
+    *(packed<u32, 1> *)loc = val - this->shdr.sh_addr - offset;
     return;
   case R_AARCH64_PREL64:
     *(u64 *)loc = val - this->shdr.sh_addr - offset;
@@ -364,10 +364,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      *(u64 *)loc = S + A;
+      *(packed<u64, 1> *)loc = S + A;
       continue;
     case R_AARCH64_ABS32:
-      *(u32 *)loc = S + A;
+      *(packed<u32, 1> *)loc = S + A;
       continue;
     default:
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
