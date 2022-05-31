@@ -288,6 +288,8 @@ public:
   void uncompress_to(Context<E> &ctx, u8 *buf);
   void scan_relocations(Context<E> &ctx);
   void write_to(Context<E> &ctx, u8 *buf);
+  void apply_reloc_common(u8 *loc, Symbol<E> &sym, const ElfRel<E> &rel, SectionFragment<E> *frag,
+                                 i64 addend, Context<E> &ctx);
   void apply_reloc_alloc(Context<E> &ctx, u8 *base);
   void apply_reloc_nonalloc(Context<E> &ctx, u8 *base);
   void kill();

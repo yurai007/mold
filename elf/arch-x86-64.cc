@@ -1,4 +1,6 @@
 #include "mold.h"
+#include <immintrin.h>
+#include <x86intrin.h>
 
 namespace mold::elf {
 
@@ -543,105 +545,335 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 //
 // Relocations against non-SHF_ALLOC sections are not scanned by
 // scan_relocations.
+
+template <>
+void InputSection<E>::apply_reloc_common(u8 *loc, Symbol<E> &sym, const ElfRel<E> &rel, SectionFragment<E> *frag,
+                                         i64 addend, Context<E> &ctx) {
+  auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
+    if (val < lo || hi <= val)
+      Error(ctx) << *this << ": relocation " << rel << " against "
+                 << sym << " out of range: " << val << " is not in ["
+                 << lo << ", " << hi << ")";
+  };
+
+  auto write8 = [&](u64 val) {
+    overflow_check(val, 0, 1 << 8);
+    *loc = val;
+  };
+
+  auto write16 = [&](u64 val) {
+    overflow_check(val, 0, 1 << 16);
+    *(ul16 *)loc = val;
+  };
+
+  auto write32 = [&](u64 val) {
+    overflow_check(val, 0, (i64)1 << 32);
+    *(ul32 *)loc = val;
+  };
+
+  auto write32s = [&](u64 val) {
+    overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
+    *(ul32 *)loc = val;
+  };
+
+#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
+#define A (frag ? (u64)addend : (u64)rel.r_addend)
+
+  switch (rel.r_type) {
+  case R_X86_64_8:
+    write8(S + A);
+    break;
+  case R_X86_64_16:
+    write16(S + A);
+    break;
+  case R_X86_64_32:
+    write32(S + A);
+    break;
+  case R_X86_64_32S:
+    write32s(S + A);
+    break;
+  case R_X86_64_64:
+    if (!frag) {
+      if (std::optional<u64> val = get_tombstone(sym)) {
+        *(ul64 *)loc = *val;
+        break;
+      }
+    }
+    *(ul64 *)loc = S + A;
+    break;
+  case R_X86_64_DTPOFF32:
+    if (std::optional<u64> val = get_tombstone(sym))
+      *(ul32 *)loc = *val;
+    else
+      write32s(S + A - ctx.tls_begin);
+    break;
+  case R_X86_64_DTPOFF64:
+    if (std::optional<u64> val = get_tombstone(sym))
+      *(ul64 *)loc = *val;
+    else
+      *(ul64 *)loc = S + A - ctx.tls_begin;
+    break;
+  case R_X86_64_SIZE32:
+    write32(sym.esym().st_size + A);
+    break;
+  case R_X86_64_SIZE64:
+    *(ul64 *)loc = sym.esym().st_size + A;
+    break;
+  default:
+    Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
+               << rel;
+    break;
+  }
+
+#undef S
+#undef A
+}
+
+using reg = __m256i;
+constexpr auto step = 8u;
+
+static reg do_upper_bound_unaligned(const int* __restrict__ base, const int* __restrict__ q, unsigned size) {
+  assert(step == 8u && size >= 16 && "Wrong step or too small size");
+
+  const reg query = _mm256_loadu_si256(reinterpret_cast<const reg*>(q));
+  reg left_idx = _mm256_set1_epi32(0);
+  auto single_step = [&base, &query, &left_idx](unsigned jump){
+    reg idx = _mm256_add_epi32(left_idx, _mm256_set1_epi32(jump));
+    reg g = _mm256_i32gather_epi32(base, idx, 4);
+    reg mask = _mm256_cmpgt_epi32(g, query);
+    left_idx = _mm256_blendv_epi8(idx, left_idx, mask);
+  };
+  unsigned length = size;
+  while (length >= 16) {
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+  }
+  while (length >= 4) {
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+  }
+  while (length >= 2) {
+    single_step(length >> 1);
+    length = (length & 1) + (length >> 1);
+  }
+  reg mask_size = _mm256_cmpgt_epi32(_mm256_set1_epi32(size), left_idx);
+  reg last_jump =  _mm256_blendv_epi8(_mm256_set1_epi32(0), _mm256_set1_epi32(1), mask_size);
+  reg idx = _mm256_add_epi32(left_idx, last_jump);
+  reg g = _mm256_i32gather_epi32(base, left_idx, 4);
+  reg mask = _mm256_cmpgt_epi32(g, query);
+  return _mm256_blendv_epi8(idx, left_idx, mask);
+}
+
+static void upper_bound_batched(const int prolog_queue_size, const std::vector<int> &offsets_queue,
+                                const std::span<u32> offsets, std::span<u32>::iterator *results) {
+  const int *base = reinterpret_cast<const int*>(offsets.data());
+  const unsigned size = offsets.size();
+  int j = 0;
+  while (j + 4*step <= prolog_queue_size) {
+    int j0 = j;
+    reg res1 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+    reg res2 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+    reg res3 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+    reg res4 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+
+    auto tmp1 = reinterpret_cast<const unsigned*>(&res1);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp1[i];
+    }
+    j0 += step;
+    auto tmp2 = reinterpret_cast<const unsigned*>(&res2);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp2[i];
+    }
+    j0 += step;
+    auto tmp3 = reinterpret_cast<const unsigned*>(&res3);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp3[i];
+    }
+    j0 += step;
+    auto tmp4 = reinterpret_cast<const unsigned*>(&res4);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp4[i];
+    }
+  }
+
+  while (j + 2*step <= prolog_queue_size) {
+    int j0 = j;
+    reg res1 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+    reg res2 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+
+    auto tmp1 = reinterpret_cast<const unsigned*>(&res1);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp1[i];
+    }
+    j0 += step;
+    auto tmp2 = reinterpret_cast<const unsigned*>(&res2);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp2[i];
+    }
+  }
+
+  while (j + 1*step <= prolog_queue_size) {
+    int j0 = j;
+    reg res1 = do_upper_bound_unaligned(base, &offsets_queue[j], size);
+    j += step;
+
+    auto tmp1 = reinterpret_cast<const unsigned*>(&res1);
+    for (auto i = 0u; i < step; i++) {
+      results[j0 + i] = offsets.begin() + tmp1[i];
+    }
+  }
+}
+
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   std::span<ElfRel<E>> rels = get_rels(ctx);
-
+#if 0
+  assert(rels.size() <= std::numeric_limits<int>::max());
+#endif
+  unsigned queue_size = 0u;
+  std::vector<std::tuple<std::span<u32>, const ElfRel<E>*, MergeableSection<E>*>> data_queue(rels.size());
+  std::vector<int> queries_queue(rels.size());
+  bool all_equal = true;
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
     if (rel.r_type == R_X86_64_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    u8 *loc = base + rel.r_offset;
 
     if (!sym.file) {
       report_undef(ctx, file, sym);
       continue;
     }
-
+    assert(!(shdr().sh_flags & SHF_ALLOC));
+    u8 *loc = base + rel.r_offset;
     SectionFragment<E> *frag;
     i64 addend;
-    std::tie(frag, addend) = get_fragment(ctx, rel);
+    bool done = false;
 
-    auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
-      if (val < lo || hi <= val)
-        Error(ctx) << *this << ": relocation " << rel << " against "
-                   << sym << " out of range: " << val << " is not in ["
-                   << lo << ", " << hi << ")";
-    };
-
-    auto write8 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 8);
-      *loc = val;
-    };
-
-    auto write16 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 16);
-      *(ul16 *)loc = val;
-    };
-
-    auto write32 = [&](u64 val) {
-      overflow_check(val, 0, (i64)1 << 32);
-      *(ul32 *)loc = val;
-    };
-
-    auto write32s = [&](u64 val) {
-      overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
-      *(ul32 *)loc = val;
-    };
-
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? (u64)addend : (u64)rel.r_addend)
-
-    switch (rel.r_type) {
-    case R_X86_64_8:
-      write8(S + A);
-      break;
-    case R_X86_64_16:
-      write16(S + A);
-      break;
-    case R_X86_64_32:
-      write32(S + A);
-      break;
-    case R_X86_64_32S:
-      write32s(S + A);
-      break;
-    case R_X86_64_64:
-      if (!frag) {
-        if (std::optional<u64> val = get_tombstone(sym)) {
-          *(ul64 *)loc = *val;
-          break;
-        }
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
+    if (esym.st_type != STT_SECTION) {
+      done = true; frag = nullptr; addend = 0;
+    }
+    if (!done) {
+      std::unique_ptr<MergeableSection<E>> &m =
+          file.mergeable_sections[file.get_shndx(esym)];
+      if (!m) {
+        done = true; frag = nullptr; addend = 0;
       }
-      *(ul64 *)loc = S + A;
-      break;
-    case R_X86_64_DTPOFF32:
-      if (std::optional<u64> val = get_tombstone(sym))
-        *(ul32 *)loc = *val;
-      else
-        write32s(S + A - ctx.tls_begin);
-      break;
-    case R_X86_64_DTPOFF64:
-      if (std::optional<u64> val = get_tombstone(sym))
-        *(ul64 *)loc = *val;
-      else
-        *(ul64 *)loc = S + A - ctx.tls_begin;
-      break;
-    case R_X86_64_SIZE32:
-      write32(sym.esym().st_size + A);
-      break;
-    case R_X86_64_SIZE64:
-      *(ul64 *)loc = sym.esym().st_size + A;
-      break;
-    default:
-      Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
-                 << rel;
-      break;
+      if (!done) {
+        // queue for later - slow path
+        i64 offset = esym.st_value + get_addend(rel);
+        std::span<u32> offsets = m->frag_offsets;
+        if (all_equal && (queue_size > 0) && std::get<0>(data_queue[queue_size-1]).data() != offsets.data()) {
+          all_equal = false;
+        }
+#if 0
+        assert(offset <= std::numeric_limits<int>::max());
+#endif
+        queries_queue[queue_size] = static_cast<int>(offset);
+        data_queue[queue_size++] = std::make_tuple(offsets, &rel, m.get());
+        continue;
+      }
+    }
+    apply_reloc_common(loc, sym, rel, frag, addend, ctx);
+  }
+  if (data_queue.empty())
+    return;
+
+  const std::span<u32> offsets = std::get<std::span<u32>>(data_queue.front());
+  if (!all_equal || queue_size < step || offsets.size() < 16) {
+    std::vector<i64> idxs(queue_size);
+    for (i64 j = 0; j < queue_size; j++) {
+      auto &item = data_queue[j];
+      i64 offset = queries_queue[j];
+      std::span<u32> offsets = std::get<std::span<u32>>(item);
+      const ElfRel<E> &rel = *std::get<const ElfRel<E>*>(item);
+      auto it = std::upper_bound(offsets.begin(), offsets.end(), offset);
+      if (it == offsets.begin())
+        Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
+      idxs[j] = it - 1 - offsets.begin();
     }
 
-#undef S
-#undef A
+    for (i64 j = 0; j < queue_size; j++) {
+      i64 idx = idxs[j];
+      auto &item = data_queue[j];
+      i64 offset = queries_queue[j];
+      std::span<u32> offsets = std::get<std::span<u32>>(item);
+      const ElfRel<E> &rel = *std::get<const ElfRel<E>*>(item);
+      MergeableSection<E>* m = std::get<MergeableSection<E>*>(item);
+      SectionFragment<E> * frag = m->fragments[idx];
+      i64 addend = offset - offsets[idx];
+      u8 *loc = base + rel.r_offset;
+      Symbol<E> &sym = *file.symbols[rel.r_sym];
+      apply_reloc_common(loc, sym, rel, frag, addend, ctx);
+    }
+  } else {
+    const unsigned prolog_queue_size = (queue_size >> 3)*step;
+    std::vector<std::span<u32>::iterator> results(prolog_queue_size);
+    upper_bound_batched(prolog_queue_size, queries_queue, offsets, &results[0]);
+
+    i64 j = 0;
+    for (; j < prolog_queue_size; j++) {
+      auto &item = data_queue[j];
+      const ElfRel<E> &rel = *std::get<const ElfRel<E>*>(item);
+      MergeableSection<E>* m = std::get<MergeableSection<E>*>(item);
+
+      auto it = results[j];
+      if (it == offsets.begin())
+        Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
+      i64 idx = it - 1 - offsets.begin();
+      SectionFragment<E> * frag = m->fragments[idx];
+      i64 offset = queries_queue[j];
+      i64 addend = offset - offsets[idx];
+      u8 *loc = base + rel.r_offset;
+      Symbol<E> &sym = *file.symbols[rel.r_sym];
+      apply_reloc_common(loc, sym, rel, frag, addend, ctx);
+    }
+
+    // process remaining epilog
+    j = prolog_queue_size;
+    std::vector<i64> idxs(queue_size - prolog_queue_size + 1);
+    for (; j < queue_size; j++) {
+      auto &item = data_queue[j];
+      i64 offset = queries_queue[j];
+      std::span<u32> offsets = std::get<std::span<u32>>(item);
+      const ElfRel<E> &rel = *std::get<const ElfRel<E>*>(item);
+      auto it = std::upper_bound(offsets.begin(), offsets.end(), offset);
+      if (it == offsets.begin())
+        Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
+      idxs[j - prolog_queue_size] = it - 1 - offsets.begin();
+    }
+    j = prolog_queue_size;
+
+    for (; j < queue_size; j++) {
+      i64 idx = idxs[j - prolog_queue_size];
+      auto &item = data_queue[j];
+      i64 offset = queries_queue[j];
+      std::span<u32> offsets = std::get<std::span<u32>>(item);
+      const ElfRel<E> &rel = *std::get<const ElfRel<E>*>(item);
+      MergeableSection<E>* m = std::get<MergeableSection<E>*>(item);
+      SectionFragment<E> * frag = m->fragments[idx];
+      i64 addend = offset - offsets[idx];
+      u8 *loc = base + rel.r_offset;
+      Symbol<E> &sym = *file.symbols[rel.r_sym];
+      apply_reloc_common(loc, sym, rel, frag, addend, ctx);
+    }
   }
 }
 
